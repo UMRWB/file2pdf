@@ -1,11 +1,11 @@
-import io
+import tempfile
 import re
+from pathlib import Path
 
 import img2pdf
-import markdown
 import streamlit as st
+from markdown_pdf import MarkdownPdf, Section
 from PIL import Image
-from xhtml2pdf import pisa
 
 
 st.set_page_config(
@@ -15,81 +15,46 @@ st.set_page_config(
 )
 
 
-HTML_TEMPLATE = """
-<!DOCTYPE html>
-<html>
-<head>
-    <meta charset="utf-8" />
-    <style>
-        @page {
-            size: A4;
-            margin: 24mm 18mm;
-        }
-        body {
-            font-family: Helvetica, Arial, sans-serif;
-            color: #1f2937;
-            font-size: 11pt;
-            line-height: 1.6;
-        }
-        h1, h2, h3, h4, h5, h6 {
-            color: #111827;
-            margin-top: 18px;
-            margin-bottom: 8px;
-            line-height: 1.25;
-        }
-        h1 { font-size: 24pt; }
-        h2 { font-size: 18pt; }
-        h3 { font-size: 14pt; }
-        p, ul, ol {
-            margin-bottom: 10px;
-        }
-        code {
-            font-family: Courier, monospace;
-            background: #f3f4f6;
-            padding: 2px 4px;
-        }
-        pre {
-            background: #f3f4f6;
-            border: 1px solid #e5e7eb;
-            padding: 10px;
-            white-space: pre-wrap;
-            word-wrap: break-word;
-        }
-        blockquote {
-            border-left: 4px solid #d1d5db;
-            color: #4b5563;
-            margin: 12px 0;
-            padding-left: 12px;
-        }
-        table {
-            width: 100%;
-            border-collapse: collapse;
-            margin: 12px 0;
-        }
-        th, td {
-            border: 1px solid #d1d5db;
-            padding: 8px;
-            text-align: left;
-            vertical-align: top;
-        }
-        th {
-            background: #f9fafb;
-        }
-        a {
-            color: #2563eb;
-            text-decoration: none;
-        }
-        hr {
-            border: none;
-            border-top: 1px solid #d1d5db;
-            margin: 16px 0;
-        }
-    </style>
-</head>
-<body>
-{body}
-</body>
-</html>
+MARKDOWN_CSS = """
+body {
+    font-family: Helvetica, Arial, sans-serif;
+    color: #1f2937;
+    font-size: 11pt;
+    line-height: 1.6;
+}
+h1, h2, h3, h4, h5, h6 {
+    color: #111827;
+    margin-top: 18px;
+    margin-bottom: 8px;
+    line-height: 1.25;
+}
+h1 { text-align: center; }
+code {
+    font-family: Courier, monospace;
+    background: #f3f4f6;
+}
+pre {
+    background: #f3f4f6;
+    border: 1px solid #e5e7eb;
+    padding: 10px;
+    white-space: pre-wrap;
+}
+blockquote {
+    border-left: 4px solid #d1d5db;
+    color: #4b5563;
+    padding-left: 12px;
+}
+table, th, td {
+    border: 1px solid #d1d5db;
+    border-collapse: collapse;
+}
+th, td {
+    padding: 8px;
+    vertical-align: top;
+}
+a {
+    color: #2563eb;
+}
 """
 
 
@@ -98,6 +63,22 @@ def sanitize_filename(name: str, fallback: str) -> str:
     cleaned = cleaned.strip("._")
     return cleaned or fallback
 
+
+def natural_sort_key(text: str):
+    return [int(part) if part.isdigit() else part.lower() for part in re.split(r"(\d+)", text)]
+
+
+def sort_uploaded_images(files, sort_mode: str):
+    reverse = sort_mode == "Filename Z → A"
+    return sorted(files, key=lambda item: natural_sort_key(item.name), reverse=reverse)
+
+
+def convert_images_to_pdf(uploaded_files):
+    image_bytes_list = []
+    for uploaded_file in uploaded_files:
+        uploaded_file.seek(0)
+        image_bytes_list.append(uploaded_file.read())
+    return img2pdf.convert(image_bytes_list)
 
 
 def read_uploaded_text(uploaded_file) -> str:
@@ -110,37 +91,29 @@ def read_uploaded_text(uploaded_file) -> str:
     return raw.decode("utf-8", errors="replace")
 
 
+def convert_markdown_to_pdf(markdown_text: str, document_title: str):
+    pdf = MarkdownPdf(toc_level=2)
+    pdf.meta["title"] = document_title
+    pdf.add_section(Section(markdown_text), user_css=MARKDOWN_CSS)
 
-def convert_images_to_pdf(uploaded_files):
-    image_bytes_list = []
-    for uploaded_file in uploaded_files:
-        uploaded_file.seek(0)
-        image_bytes_list.append(uploaded_file.read())
-    return img2pdf.convert(image_bytes_list)
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp_pdf:
+        tmp_path = tmp_pdf.name
 
-
-
-def convert_markdown_to_pdf(markdown_text: str):
-    html_body = markdown.markdown(
-        markdown_text,
-        extensions=["extra", "tables", "fenced_code", "sane_lists", "toc"],
-    )
-    html_document = HTML_TEMPLATE.format(body=html_body)
-    output = io.BytesIO()
-    pdf = pisa.CreatePDF(io.StringIO(html_document), dest=output)
-    return output.getvalue(), pdf.err
+    try:
+        pdf.save(tmp_path)
+        return Path(tmp_path).read_bytes()
+    finally:
+        Path(tmp_path).unlink(missing_ok=True)
 
 
 st.title("📄 File to PDF Converter")
-st.markdown(
-    "Convert **images** or **Markdown** files into downloadable PDF documents."
-)
+st.markdown("Convert **images** or **Markdown** files into downloadable PDF documents.")
 
 image_tab, markdown_tab = st.tabs(["🖼️ Image to PDF", "📝 Markdown to PDF"])
 
 with image_tab:
     st.subheader("Image to PDF")
-    st.write("Upload one or more JPG, PNG, or WebP files and combine them into a single PDF.")
+    st.write("Upload one or more JPG, PNG, or WebP files, sort them, and combine them into a single PDF.")
 
     uploaded_images = st.file_uploader(
         "Choose image files",
@@ -152,17 +125,30 @@ with image_tab:
 
     if uploaded_images:
         st.success(f"✓ {len(uploaded_images)} file(s) uploaded")
-        st.subheader("Preview")
 
+        sort_mode = st.radio(
+            "Sort images before conversion",
+            options=["Filename A → Z", "Filename Z → A"],
+            horizontal=True,
+            key="image_sort_mode",
+        )
+        sorted_images = sort_uploaded_images(uploaded_images, sort_mode)
+
+        st.subheader("Sorted order")
+        st.caption("The PDF page order will follow this list.")
+        for index, file in enumerate(sorted_images, start=1):
+            st.write(f"{index}. {file.name}")
+
+        st.subheader("Preview")
         cols_per_row = 3
-        for i in range(0, len(uploaded_images), cols_per_row):
+        for i in range(0, len(sorted_images), cols_per_row):
             cols = st.columns(cols_per_row)
             for j, col in enumerate(cols):
-                if i + j < len(uploaded_images):
+                if i + j < len(sorted_images):
                     with col:
-                        file = uploaded_images[i + j]
+                        file = sorted_images[i + j]
                         image = Image.open(file)
-                        st.image(image, caption=file.name, use_container_width=True)
+                        st.image(image, caption=f"{i + j + 1}. {file.name}", use_container_width=True)
                         file.seek(0)
 
         image_pdf_filename = st.text_input(
@@ -174,7 +160,7 @@ with image_tab:
         if st.button("🔄 Convert images to PDF", type="primary", key="image_convert"):
             try:
                 with st.spinner("Converting images to PDF..."):
-                    pdf_bytes = convert_images_to_pdf(uploaded_images)
+                    pdf_bytes = convert_images_to_pdf(sorted_images)
 
                 final_name = sanitize_filename(image_pdf_filename, "converted_images")
                 st.success("✓ PDF created successfully!")
@@ -188,7 +174,7 @@ with image_tab:
                 )
 
                 pdf_size_mb = len(pdf_bytes) / (1024 * 1024)
-                st.info(f"📊 PDF size: {pdf_size_mb:.2f} MB | Pages: {len(uploaded_images)}")
+                st.info(f"📊 PDF size: {pdf_size_mb:.2f} MB | Pages: {len(sorted_images)}")
             except Exception as exc:
                 st.error(f"❌ Error converting images to PDF: {exc}")
                 st.exception(exc)
@@ -197,7 +183,7 @@ with image_tab:
 
 with markdown_tab:
     st.subheader("Markdown to PDF")
-    st.write("Upload a Markdown file, preview it, and export it as a styled PDF document.")
+    st.write("Upload a Markdown file, preview it, and export it as a PDF using the markdown-pdf library.")
 
     uploaded_markdown = st.file_uploader(
         "Choose a Markdown file",
@@ -227,12 +213,9 @@ with markdown_tab:
         if st.button("🔄 Convert Markdown to PDF", type="primary", key="markdown_convert"):
             try:
                 with st.spinner("Converting Markdown to PDF..."):
-                    pdf_bytes, pdf_error = convert_markdown_to_pdf(markdown_text)
+                    final_name = sanitize_filename(markdown_pdf_filename, "converted_markdown")
+                    pdf_bytes = convert_markdown_to_pdf(markdown_text, final_name)
 
-                if pdf_error:
-                    raise ValueError("The PDF renderer could not process the Markdown content.")
-
-                final_name = sanitize_filename(markdown_pdf_filename, "converted_markdown")
                 st.success("✓ PDF created successfully!")
                 st.download_button(
                     label="📥 Download Markdown PDF",
@@ -255,10 +238,11 @@ with st.expander("ℹ️ Features"):
     st.markdown(
         """
 - Image mode supports JPG, JPEG, PNG, and WebP.
-- Markdown mode supports headings, lists, tables, blockquotes, links, and fenced code blocks.
+- Uploaded images are sorted by filename before conversion.
+- Markdown mode uses the `markdown-pdf` library for PDF generation.
 - PDF files are generated in memory and downloaded directly from the app.
         """
     )
 
 st.markdown("---")
-st.caption("Built with Streamlit, img2pdf, markdown, and xhtml2pdf")
+st.caption("Built with Streamlit, img2pdf, pillow, and markdown-pdf")
