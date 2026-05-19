@@ -284,8 +284,8 @@ with markdown_tab:
             key="markdown_filename",
         )
 
-        st.subheader("Preview")
-        st.markdown(markdown_text)
+        with st.expander("Preview"):
+            st.markdown(markdown_text)
 
         with st.expander("Show raw Markdown"):
             st.code(markdown_text, language="markdown")
