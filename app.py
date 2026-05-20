@@ -131,9 +131,12 @@ def read_uploaded_text(uploaded_file) -> str:
 
 
 def convert_markdown_to_pdf(markdown_text: str, document_title: str):
-    pdf = MarkdownPdf(toc_level=2)
+    # Detect whether content has an H1; if not, disable TOC to avoid hierarchy error
+    has_h1 = any(line.startswith("# ") or line == "#" for line in markdown_text.splitlines())
+    toc_level = 2 if has_h1 else 0
+    pdf = MarkdownPdf(toc_level=toc_level)
     pdf.meta["title"] = document_title
-    pdf.add_section(Section(markdown_text), user_css=MARKDOWN_CSS)
+    pdf.add_section(Section(markdown_text, toc=bool(toc_level)), user_css=MARKDOWN_CSS)
     with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
         tmp_path = tmp.name
     try:
