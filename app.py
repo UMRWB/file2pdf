@@ -58,6 +58,7 @@ QUALITY_PRESETS = {
     "Original (lossless)": {"max_dim": None, "jpeg_quality": None},
     "Balanced":            {"max_dim": 2048,  "jpeg_quality": 82},
     "Compressed":          {"max_dim": 1280,  "jpeg_quality": 65},
+    "Smallest":            {"max_dim": 900,    "jpeg_quality": 40},
 }
 
 
@@ -74,15 +75,6 @@ def natural_sort_key(text: str):
 def sort_uploaded_images(files, sort_mode: str):
     reverse = sort_mode == "Filename Z → A"
     return sorted(files, key=lambda f: natural_sort_key(f.name), reverse=reverse)
-
-
-def make_preview_image(uploaded_file, max_size=(240, 240)):
-    uploaded_file.seek(0)
-    img = Image.open(uploaded_file)
-    preview = img.copy()
-    preview.thumbnail(max_size, Image.LANCZOS)
-    uploaded_file.seek(0)
-    return preview
 
 
 def preprocess_image(uploaded_file, max_dim, jpeg_quality):
@@ -186,7 +178,8 @@ with image_tab:
                 help=(
                     "**Original**: lossless — images embedded as-is, largest files.\n\n"
                     "**Balanced**: resizes images > 2048 px and re-encodes to JPEG 82.\n\n"
-                    "**Compressed**: resizes to 1280 px max and re-encodes to JPEG 65."
+                    "**Compressed**: resizes to 1280 px max and re-encodes to JPEG 65.\n\n"
+                    "**Smallest**: resizes to 900 px max and re-encodes to JPEG 40 — most aggressive, smallest files."
                 ),
             )
 
@@ -196,17 +189,6 @@ with image_tab:
             st.caption("The PDF page order will follow this list.")
             for idx, f in enumerate(sorted_images, 1):
                 st.write(f"{idx}. {f.name}")
-
-        with st.expander("Small preview"):
-            cols_per_row = 3
-            for i in range(0, len(sorted_images), cols_per_row):
-                cols = st.columns(cols_per_row)
-                for j, col in enumerate(cols):
-                    if i + j < len(sorted_images):
-                        with col:
-                            file = sorted_images[i + j]
-                            preview = make_preview_image(file, max_size=(240, 240))
-                            st.image(preview, caption=f"{i+j+1}. {file.name}", use_container_width=True)
 
         image_pdf_filename = st.text_input(
             "Output filename (without extension)",
@@ -320,11 +302,11 @@ with st.expander("ℹ️ Features"):
         """
 - **Image to PDF**: supports JPG, PNG, WebP, and HEIF/HEIC formats.
 - **Sorting**: images are sorted by filename (A→Z or Z→A) before conversion.
-- **Preview**: image previews use small thumbnails inside an expander for faster loading.
 - **PDF quality presets**:
   - *Original* — lossless, images embedded as-is.
   - *Balanced* — resizes images > 2048 px and re-encodes to JPEG quality 82.
   - *Compressed* — resizes to 1280 px max and re-encodes to JPEG quality 65.
+  - *Smallest* — resizes to 900 px max and re-encodes to JPEG quality 40, for the smallest possible files.
 - **Markdown to PDF**: powered by `markdown-pdf`; accepts uploaded `.md` files or pasted plain text / Markdown.
         """
     )
