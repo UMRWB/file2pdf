@@ -3,3 +3,4 @@ img2pdf
 pillow
 pillow-heif
 markdown-pdf
+psutil
