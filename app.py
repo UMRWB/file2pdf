@@ -1,14 +1,19 @@
 import io
 import re
 import tempfile
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 import img2pdf
-import psutil
 import streamlit as st
 from markdown_pdf import MarkdownPdf, Section
 from PIL import Image
+
+try:
+    import psutil
+    PSUTIL_AVAILABLE = True
+except ImportError:
+    PSUTIL_AVAILABLE = False
 
 st.set_page_config(
     page_title="File to PDF Converter",
@@ -60,28 +65,33 @@ QUALITY_PRESETS = {
     "Smallest":            {"max_dim": 900,  "jpeg_quality": 40},
 }
 
+MAX_TOTAL_UPLOAD_MB = 300  # guardrail to avoid holding too much in memory at once
+MAX_WORKERS = 4            # conservative thread count to avoid CPU/memory spikes
+
 
 # ── System resource display ────────────────────────────────────────────────────
 
-def get_system_stats():
-    vm = psutil.virtual_memory()
-    cpu_percent = psutil.cpu_percent(interval=0.1)
-    cpu_count = psutil.cpu_count(logical=True)
-    return {
-        "ram_total_gb": vm.total / (1024 ** 3),
-        "ram_used_gb": vm.used / (1024 ** 3),
-        "ram_percent": vm.percent,
-        "cpu_percent": cpu_percent,
-        "cpu_count": cpu_count,
-    }
-
-
 def render_system_stats():
-    stats = get_system_stats()
-    col1, col2, col3 = st.columns(3)
-    col1.metric("🧠 RAM used", f"{stats['ram_used_gb']:.1f} / {stats['ram_total_gb']:.1f} GB", f"{stats['ram_percent']:.0f}%")
-    col2.metric("⚙️ CPU usage", f"{stats['cpu_percent']:.0f}%")
-    col3.metric("🧮 CPU cores", f"{stats['cpu_count']}")
+    if not PSUTIL_AVAILABLE:
+        st.caption("ℹ️ System stats unavailable (psutil not installed).")
+        return
+
+    try:
+        vm = psutil.virtual_memory()
+        # Non-blocking call: uses the delta since the last call instead of sleeping.
+        cpu_percent = psutil.cpu_percent(interval=None)
+        cpu_count = psutil.cpu_count(logical=True) or 1
+
+        col1, col2, col3 = st.columns(3)
+        col1.metric(
+            "🧠 RAM used",
+            f"{vm.used / (1024 ** 3):.1f} / {vm.total / (1024 ** 3):.1f} GB",
+            f"{vm.percent:.0f}%",
+        )
+        col2.metric("⚙️ CPU usage", f"{cpu_percent:.0f}%")
+        col3.metric("🧮 CPU cores", f"{cpu_count}")
+    except Exception:
+        st.caption("ℹ️ System stats temporarily unavailable.")
 
 
 # ── Helpers ─────────────────────────────────────────────────────────────────────
@@ -101,40 +111,46 @@ def sort_uploaded_images(files, sort_mode: str):
     return sorted(files, key=lambda f: natural_sort_key(f.name), reverse=reverse)
 
 
-def ensure_heif_support():
-    """Lazily register the HEIF opener only when a HEIF/HEIC file is present."""
-    from pillow_heif import register_heif_opener
-    register_heif_opener()
-
-
 def has_heif_files(files) -> bool:
     heif_exts = {"heif", "heic", "heifs", "heics", "hif"}
     return any(f.name.rsplit(".", 1)[-1].lower() in heif_exts for f in files)
 
 
-@st.cache_data(show_spinner=False)
+def ensure_heif_support() -> bool:
+    """Lazily register the HEIF opener only when a HEIF/HEIC file is present.
+    Returns True if registration succeeded, False otherwise (missing dependency)."""
+    try:
+        from pillow_heif import register_heif_opener
+        register_heif_opener()
+        return True
+    except Exception:
+        return False
+
+
 def preprocess_image_bytes(file_bytes: bytes, max_dim, jpeg_quality) -> bytes:
     """
-    Cached: decode → optionally resize → re-encode to JPEG.
+    Pure function (no Streamlit calls, no caching) so it is safe to run inside
+    worker threads: decode → optionally resize → re-encode to JPEG.
     Returns raw bytes unchanged if no resize/re-encode requested (lossless).
     """
     if max_dim is None and jpeg_quality is None:
         return file_bytes
 
-    img = Image.open(io.BytesIO(file_bytes))
+    with Image.open(io.BytesIO(file_bytes)) as img:
+        img.load()  # force decode while the BytesIO buffer is still in scope
 
-    if img.mode not in ("RGB", "L"):
-        img = img.convert("RGB")
+        if img.mode not in ("RGB", "L"):
+            img = img.convert("RGB")
 
-    if max_dim is not None:
-        w, h = img.size
-        if max(w, h) > max_dim:
-            scale = max_dim / max(w, h)
-            img = img.resize((int(w * scale), int(h * scale)), Image.LANCZOS)
+        if max_dim is not None:
+            w, h = img.size
+            if max(w, h) > max_dim:
+                scale = max_dim / max(w, h)
+                img = img.resize((max(1, int(w * scale)), max(1, int(h * scale))), Image.LANCZOS)
 
-    buf = io.BytesIO()
-    img.save(buf, format="JPEG", quality=jpeg_quality, optimize=True)
-    return buf.getvalue()
+        buf = io.BytesIO()
+        img.save(buf, format="JPEG", quality=jpeg_quality, optimize=True)
+        return buf.getvalue()
 
 
 def convert_images_to_pdf(uploaded_files, quality_preset: str):
@@ -148,13 +164,27 @@ def convert_images_to_pdf(uploaded_files, quality_preset: str):
         raw_bytes_list.append(f.read())
         f.seek(0)
 
-    # Parallelize the CPU-bound decode/resize/encode work across files
-    with ThreadPoolExecutor(max_workers=min(8, len(raw_bytes_list) or 1)) as executor:
-        image_bytes_list = list(
-            executor.map(lambda b: preprocess_image_bytes(b, max_dim, jpeg_quality), raw_bytes_list)
-        )
+    results = [None] * len(raw_bytes_list)
+    errors = []
 
-    return img2pdf.convert(image_bytes_list)
+    worker_count = max(1, min(MAX_WORKERS, len(raw_bytes_list)))
+    with ThreadPoolExecutor(max_workers=worker_count) as executor:
+        future_to_index = {
+            executor.submit(preprocess_image_bytes, raw, max_dim, jpeg_quality): idx
+            for idx, raw in enumerate(raw_bytes_list)
+        }
+        for future in as_completed(future_to_index):
+            idx = future_to_index[future]
+            try:
+                results[idx] = future.result()
+            except Exception as exc:
+                errors.append((uploaded_files[idx].name, str(exc)))
+
+    if errors:
+        error_list = ", ".join(f"{name} ({msg})" for name, msg in errors)
+        raise ValueError(f"Failed to process {len(errors)} file(s): {error_list}")
+
+    return img2pdf.convert(results)
 
 
 def read_uploaded_text(uploaded_file) -> str:
@@ -167,7 +197,7 @@ def read_uploaded_text(uploaded_file) -> str:
     return raw.decode("utf-8", errors="replace")
 
 
-@st.cache_data(show_spinner=False)
+@st.cache_data(show_spinner=False, max_entries=20, ttl=1800)
 def convert_markdown_to_pdf(markdown_text: str, document_title: str) -> bytes:
     has_h1 = any(line.startswith("# ") or line == "#" for line in markdown_text.splitlines())
     toc_level = 2 if has_h1 else 0
@@ -205,10 +235,26 @@ with image_tab:
     )
 
     if uploaded_images:
-        st.success(f"✓ {len(uploaded_images)} file(s) uploaded")
+        total_mb = sum(f.size for f in uploaded_images) / (1024 * 1024)
+        st.success(f"✓ {len(uploaded_images)} file(s) uploaded ({total_mb:.1f} MB total)")
 
-        if has_heif_files(uploaded_images):
-            ensure_heif_support()
+        if total_mb > MAX_TOTAL_UPLOAD_MB:
+            st.warning(
+                f"⚠️ You've uploaded {total_mb:.0f} MB of images, which exceeds the "
+                f"{MAX_TOTAL_UPLOAD_MB} MB guideline. Converting this much data at once "
+                "may use a lot of memory and could cause the app to crash. Consider using "
+                "the Compressed or Smallest quality preset, or converting in smaller batches."
+            )
+
+        heif_present = has_heif_files(uploaded_images)
+        heif_ready = True
+        if heif_present:
+            heif_ready = ensure_heif_support()
+            if not heif_ready:
+                st.error(
+                    "❌ HEIF/HEIC files were detected, but the `pillow-heif` library "
+                    "isn't available. Please install it or remove HEIF files."
+                )
 
         with st.form("image_settings_form"):
             col_sort, col_quality = st.columns(2)
@@ -239,7 +285,9 @@ with image_tab:
                 key="image_filename",
             )
 
-            submitted = st.form_submit_button("🔄 Convert images to PDF", type="primary")
+            submitted = st.form_submit_button(
+                "🔄 Convert images to PDF", type="primary", disabled=(heif_present and not heif_ready)
+            )
 
         sorted_images = sort_uploaded_images(uploaded_images, st.session_state["image_sort_mode"])
 
@@ -267,7 +315,6 @@ with image_tab:
                 st.info(f"📊 PDF size: {pdf_size_mb:.2f} MB | Pages: {len(sorted_images)} | Quality: {st.session_state['image_quality']}")
             except Exception as exc:
                 st.error(f"❌ Error converting images to PDF: {exc}")
-                st.exception(exc)
     else:
         st.info("👆 Upload image files to get started")
 
@@ -346,7 +393,6 @@ with markdown_tab:
                 st.info(f"📊 PDF size: {pdf_size_kb:.1f} KB")
             except Exception as exc:
                 st.error(f"❌ Error converting Markdown to PDF: {exc}")
-                st.exception(exc)
     else:
         st.info("👆 Paste some text above to get started")
 
@@ -362,7 +408,7 @@ with st.expander("ℹ️ Features"):
   - *Compressed* — resizes to 1280 px max and re-encodes to JPEG quality 65.
   - *Smallest* — resizes to 900 px max and re-encodes to JPEG quality 40, for the smallest possible files.
 - **Markdown to PDF**: powered by `markdown-pdf`; accepts uploaded `.md` files or pasted plain text / Markdown.
-- **Performance**: image preprocessing is cached and parallelized; Markdown conversion is cached; HEIF support loads only when needed.
+- **Reliability**: bounded caching, per-file error isolation, and an upload size guardrail help prevent crashes.
         """
     )
 
