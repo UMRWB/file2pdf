@@ -1,15 +1,14 @@
 import io
 import re
 import tempfile
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import img2pdf
+import psutil
 import streamlit as st
 from markdown_pdf import MarkdownPdf, Section
 from PIL import Image
-from pillow_heif import register_heif_opener
-
-register_heif_opener()
 
 st.set_page_config(
     page_title="File to PDF Converter",
@@ -56,11 +55,36 @@ a { color: #2563eb; }
 
 QUALITY_PRESETS = {
     "Original (lossless)": {"max_dim": None, "jpeg_quality": None},
-    "Balanced":            {"max_dim": 2048,  "jpeg_quality": 82},
-    "Compressed":          {"max_dim": 1280,  "jpeg_quality": 65},
-    "Smallest":            {"max_dim": 900,    "jpeg_quality": 40},
+    "Balanced":            {"max_dim": 2048, "jpeg_quality": 82},
+    "Compressed":          {"max_dim": 1280, "jpeg_quality": 65},
+    "Smallest":            {"max_dim": 900,  "jpeg_quality": 40},
 }
 
+
+# ── System resource display ────────────────────────────────────────────────────
+
+def get_system_stats():
+    vm = psutil.virtual_memory()
+    cpu_percent = psutil.cpu_percent(interval=0.1)
+    cpu_count = psutil.cpu_count(logical=True)
+    return {
+        "ram_total_gb": vm.total / (1024 ** 3),
+        "ram_used_gb": vm.used / (1024 ** 3),
+        "ram_percent": vm.percent,
+        "cpu_percent": cpu_percent,
+        "cpu_count": cpu_count,
+    }
+
+
+def render_system_stats():
+    stats = get_system_stats()
+    col1, col2, col3 = st.columns(3)
+    col1.metric("🧠 RAM used", f"{stats['ram_used_gb']:.1f} / {stats['ram_total_gb']:.1f} GB", f"{stats['ram_percent']:.0f}%")
+    col2.metric("⚙️ CPU usage", f"{stats['cpu_percent']:.0f}%")
+    col3.metric("🧮 CPU cores", f"{stats['cpu_count']}")
+
+
+# ── Helpers ─────────────────────────────────────────────────────────────────────
 
 def sanitize_filename(name: str, fallback: str) -> str:
     cleaned = re.sub(r"[^A-Za-z0-9._-]+", "_", (name or "").strip())
@@ -77,22 +101,31 @@ def sort_uploaded_images(files, sort_mode: str):
     return sorted(files, key=lambda f: natural_sort_key(f.name), reverse=reverse)
 
 
-def preprocess_image(uploaded_file, max_dim, jpeg_quality):
+def ensure_heif_support():
+    """Lazily register the HEIF opener only when a HEIF/HEIC file is present."""
+    from pillow_heif import register_heif_opener
+    register_heif_opener()
+
+
+def has_heif_files(files) -> bool:
+    heif_exts = {"heif", "heic", "heifs", "heics", "hif"}
+    return any(f.name.rsplit(".", 1)[-1].lower() in heif_exts for f in files)
+
+
+@st.cache_data(show_spinner=False)
+def preprocess_image_bytes(file_bytes: bytes, max_dim, jpeg_quality) -> bytes:
     """
-    If max_dim or jpeg_quality is set, decode → optionally resize → re-encode to JPEG.
-    Otherwise return the raw bytes unchanged for lossless embedding.
+    Cached: decode → optionally resize → re-encode to JPEG.
+    Returns raw bytes unchanged if no resize/re-encode requested (lossless).
     """
-    uploaded_file.seek(0)
     if max_dim is None and jpeg_quality is None:
-        return uploaded_file.read()
+        return file_bytes
 
-    img = Image.open(uploaded_file)
+    img = Image.open(io.BytesIO(file_bytes))
 
-    # Convert palette / RGBA to RGB for JPEG re-encoding
     if img.mode not in ("RGB", "L"):
         img = img.convert("RGB")
 
-    # Resize if largest dimension exceeds max_dim
     if max_dim is not None:
         w, h = img.size
         if max(w, h) > max_dim:
@@ -108,7 +141,19 @@ def convert_images_to_pdf(uploaded_files, quality_preset: str):
     preset = QUALITY_PRESETS[quality_preset]
     max_dim = preset["max_dim"]
     jpeg_quality = preset["jpeg_quality"]
-    image_bytes_list = [preprocess_image(f, max_dim, jpeg_quality) for f in uploaded_files]
+
+    raw_bytes_list = []
+    for f in uploaded_files:
+        f.seek(0)
+        raw_bytes_list.append(f.read())
+        f.seek(0)
+
+    # Parallelize the CPU-bound decode/resize/encode work across files
+    with ThreadPoolExecutor(max_workers=min(8, len(raw_bytes_list) or 1)) as executor:
+        image_bytes_list = list(
+            executor.map(lambda b: preprocess_image_bytes(b, max_dim, jpeg_quality), raw_bytes_list)
+        )
+
     return img2pdf.convert(image_bytes_list)
 
 
@@ -122,8 +167,8 @@ def read_uploaded_text(uploaded_file) -> str:
     return raw.decode("utf-8", errors="replace")
 
 
-def convert_markdown_to_pdf(markdown_text: str, document_title: str):
-    # Detect whether content has an H1; if not, disable TOC to avoid hierarchy error
+@st.cache_data(show_spinner=False)
+def convert_markdown_to_pdf(markdown_text: str, document_title: str) -> bytes:
     has_h1 = any(line.startswith("# ") or line == "#" for line in markdown_text.splitlines())
     toc_level = 2 if has_h1 else 0
     pdf = MarkdownPdf(toc_level=toc_level)
@@ -141,6 +186,7 @@ def convert_markdown_to_pdf(markdown_text: str, document_title: str):
 # ── UI ────────────────────────────────────────────────────────────────────────
 
 st.title("📄 File to PDF Converter")
+render_system_stats()
 st.markdown("Convert **images** or **Markdown** files into downloadable PDF documents.")
 
 image_tab, markdown_tab = st.tabs(["🖼️ Image to PDF", "📝 Markdown to PDF"])
@@ -161,47 +207,53 @@ with image_tab:
     if uploaded_images:
         st.success(f"✓ {len(uploaded_images)} file(s) uploaded")
 
-        col_sort, col_quality = st.columns(2)
+        if has_heif_files(uploaded_images):
+            ensure_heif_support()
 
-        with col_sort:
-            sort_mode = st.radio(
-                "Sort order",
-                options=["Filename A → Z", "Filename Z → A"],
-                key="image_sort_mode",
+        with st.form("image_settings_form"):
+            col_sort, col_quality = st.columns(2)
+
+            with col_sort:
+                sort_mode = st.radio(
+                    "Sort order",
+                    options=["Filename A → Z", "Filename Z → A"],
+                    key="image_sort_mode",
+                )
+
+            with col_quality:
+                quality_preset = st.radio(
+                    "PDF quality",
+                    options=list(QUALITY_PRESETS.keys()),
+                    key="image_quality",
+                    help=(
+                        "**Original**: lossless — images embedded as-is, largest files.\n\n"
+                        "**Balanced**: resizes images > 2048 px and re-encodes to JPEG 82.\n\n"
+                        "**Compressed**: resizes to 1280 px max and re-encodes to JPEG 65.\n\n"
+                        "**Smallest**: resizes to 900 px max and re-encodes to JPEG 40 — most aggressive, smallest files."
+                    ),
+                )
+
+            image_pdf_filename = st.text_input(
+                "Output filename (without extension)",
+                value="converted_images",
+                key="image_filename",
             )
 
-        with col_quality:
-            quality_preset = st.radio(
-                "PDF quality",
-                options=list(QUALITY_PRESETS.keys()),
-                key="image_quality",
-                help=(
-                    "**Original**: lossless — images embedded as-is, largest files.\n\n"
-                    "**Balanced**: resizes images > 2048 px and re-encodes to JPEG 82.\n\n"
-                    "**Compressed**: resizes to 1280 px max and re-encodes to JPEG 65.\n\n"
-                    "**Smallest**: resizes to 900 px max and re-encodes to JPEG 40 — most aggressive, smallest files."
-                ),
-            )
+            submitted = st.form_submit_button("🔄 Convert images to PDF", type="primary")
 
-        sorted_images = sort_uploaded_images(uploaded_images, sort_mode)
+        sorted_images = sort_uploaded_images(uploaded_images, st.session_state["image_sort_mode"])
 
         with st.expander("Sorted image list"):
             st.caption("The PDF page order will follow this list.")
             for idx, f in enumerate(sorted_images, 1):
                 st.write(f"{idx}. {f.name}")
 
-        image_pdf_filename = st.text_input(
-            "Output filename (without extension)",
-            value="converted_images",
-            key="image_filename",
-        )
-
-        if st.button("🔄 Convert images to PDF", type="primary", key="image_convert"):
+        if submitted:
             try:
                 with st.spinner("Converting images to PDF..."):
-                    pdf_bytes = convert_images_to_pdf(sorted_images, quality_preset)
+                    pdf_bytes = convert_images_to_pdf(sorted_images, st.session_state["image_quality"])
 
-                final_name = sanitize_filename(image_pdf_filename, "converted_images")
+                final_name = sanitize_filename(st.session_state["image_filename"], "converted_images")
                 st.success("✓ PDF created successfully!")
                 st.download_button(
                     label="📥 Download image PDF",
@@ -212,7 +264,7 @@ with image_tab:
                     key="image_download",
                 )
                 pdf_size_mb = len(pdf_bytes) / (1024 * 1024)
-                st.info(f"📊 PDF size: {pdf_size_mb:.2f} MB | Pages: {len(sorted_images)} | Quality: {quality_preset}")
+                st.info(f"📊 PDF size: {pdf_size_mb:.2f} MB | Pages: {len(sorted_images)} | Quality: {st.session_state['image_quality']}")
             except Exception as exc:
                 st.error(f"❌ Error converting images to PDF: {exc}")
                 st.exception(exc)
@@ -295,6 +347,8 @@ with markdown_tab:
             except Exception as exc:
                 st.error(f"❌ Error converting Markdown to PDF: {exc}")
                 st.exception(exc)
+    else:
+        st.info("👆 Paste some text above to get started")
 
 # ── Footer ────────────────────────────────────────────────────────────────────
 with st.expander("ℹ️ Features"):
@@ -308,8 +362,9 @@ with st.expander("ℹ️ Features"):
   - *Compressed* — resizes to 1280 px max and re-encodes to JPEG quality 65.
   - *Smallest* — resizes to 900 px max and re-encodes to JPEG quality 40, for the smallest possible files.
 - **Markdown to PDF**: powered by `markdown-pdf`; accepts uploaded `.md` files or pasted plain text / Markdown.
+- **Performance**: image preprocessing is cached and parallelized; Markdown conversion is cached; HEIF support loads only when needed.
         """
     )
 
 st.markdown("---")
-st.caption("Built with Streamlit · img2pdf · pillow-heif · markdown-pdf")
+st.caption("Built with Streamlit · img2pdf · pillow-heif · markdown-pdf · psutil")
